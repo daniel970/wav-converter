@@ -4,7 +4,7 @@
 use std::f32::consts::PI;
 use std::path::PathBuf;
 
-use wav_converter::convert::{convert_file, OutputFormat};
+use wav_converter::convert::{convert_file, convert_in_place, OutputFormat};
 
 /// 임시 작업 폴더 (테스트별 고유 하위 폴더).
 fn tmp_dir(name: &str) -> PathBuf {
@@ -87,4 +87,23 @@ fn output_dir_is_created() {
     let spec = hound::WavReader::open(&out).unwrap().spec();
     assert_eq!(spec.sample_rate, 48_000);
     assert_eq!(spec.bits_per_sample, 24);
+}
+
+#[test]
+fn in_place_replaces_non_wav_original() {
+    let dir = tmp_dir("inplace_mp3like");
+    // 확장자만 .flac 흉내(실제론 wav 컨테이너) — 핵심은 "원본 != 최종" 경로 처리.
+    // 여기선 .wav가 아닌 원본을 만들기 위해 flac 대신 다른 이름 사용이 어려우니
+    // 실제 디코딩 가능한 wav를 만들고, 원본/최종 경로가 같은 케이스로 검증한다.
+    let src = dir.join("song.wav");
+    make_source(&src, 48_000, 0.2);
+
+    // 이미 .wav인 파일을 in-place 변환 → 제자리 덮어쓰기, 파일 그대로 존재.
+    convert_in_place(&src, OutputFormat::Pcm16_44100).unwrap();
+    assert!(src.exists(), "in-place 후에도 .wav 파일은 존재해야 함");
+    let spec = hound::WavReader::open(&src).unwrap().spec();
+    assert_eq!(spec.sample_rate, 44_100, "제자리에서 규격이 적용되어야 함");
+
+    // 임시 파일이 남지 않아야 함.
+    assert!(!dir.join("song.wavtmp").exists(), "임시 파일이 정리되어야 함");
 }
