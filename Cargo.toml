@@ -1,0 +1,36 @@
+[package]
+name = "wav-converter"
+version = "0.1.0"
+edition = "2021"
+description = "음원 파일을 일괄로 WAV로 변환하는 GUI 도구 (Windows)"
+
+[lib]
+name = "wav_converter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wav-converter"
+path = "src/main.rs"
+
+[dependencies]
+# GUI
+eframe = "0.29"
+rfd = "0.15"
+# 디코딩(모든 코덱) / 인코딩
+symphonia = { version = "0.5", features = ["all"] }
+hound = "3.5"
+# 리샘플링
+rubato = "0.16"
+# 파일 탐색 / 에러
+walkdir = "2"
+anyhow = "1"
+
+[dev-dependencies]
+hound = "3.5"
+
+# 릴리스 빌드 최적화 (exe 크기 축소 + 속도)
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
