@@ -93,29 +93,23 @@ impl eframe::App for App {
                 self.drop_target = Zone::Input;
             }
 
-            // ===== 끌어다 놓기 대상 선택 =====
-            ui.horizontal(|ui| {
-                ui.label("끌어다 놓기 대상:");
-                ui.add_enabled_ui(!running, |ui| {
-                    ui.radio_value(&mut self.drop_target, Zone::Input, "📥 입력 폴더");
-                    ui.add_enabled_ui(!self.same_as_input, |ui| {
-                        ui.radio_value(&mut self.drop_target, Zone::Output, "💾 출력 폴더");
-                    });
-                });
-            });
+            // ===== 안내 =====
             ui.small(if hovering_files {
-                "⬇ 지금 놓으면 위에서 선택한 대상으로 들어갑니다."
+                match self.drop_target {
+                    Zone::Input => "⬇ 지금 놓으면 [입력 폴더]로 들어갑니다.",
+                    Zone::Output => "⬇ 지금 놓으면 [출력 폴더]로 들어갑니다.",
+                }
             } else {
-                "폴더를 창에 끌어다 놓으면 선택한 대상으로 지정됩니다. (또는 각 박스의 버튼 사용)"
+                "박스를 클릭해 드롭 대상(파란 테두리)을 고른 뒤, 폴더를 창에 끌어다 놓으세요. (또는 박스 안 버튼으로 직접 선택)"
             });
 
             ui.add_space(6.0);
 
-            // ===== 좌우 큰 영역 =====
-            let zone_height = 140.0;
+            // ===== 좌우 큰 영역 (박스 클릭 = 드롭 대상 선택) =====
+            let zone_height = 150.0;
             ui.columns(2, |cols| {
                 // --- 왼쪽: 입력 폴더 ---
-                if drop_zone(
+                let (clicked, pick) = drop_zone(
                     &mut cols[0],
                     zone_height,
                     "📥 입력 폴더",
@@ -123,7 +117,12 @@ impl eframe::App for App {
                     "(폴더를 선택하거나 끌어다 놓으세요)",
                     !running,
                     self.drop_target == Zone::Input,
-                ) {
+                );
+                if clicked {
+                    self.drop_target = Zone::Input;
+                }
+                if pick {
+                    self.drop_target = Zone::Input;
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.input_dir = Some(dir);
                     }
@@ -136,7 +135,7 @@ impl eframe::App for App {
                 } else {
                     "(폴더를 선택하거나 끌어다 놓으세요)"
                 };
-                if drop_zone(
+                let (clicked, pick) = drop_zone(
                     &mut cols[1],
                     zone_height,
                     "💾 출력 폴더",
@@ -144,7 +143,12 @@ impl eframe::App for App {
                     out_hint,
                     out_enabled,
                     !self.same_as_input && self.drop_target == Zone::Output,
-                ) {
+                );
+                if clicked {
+                    self.drop_target = Zone::Output;
+                }
+                if pick {
+                    self.drop_target = Zone::Output;
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.output_dir = Some(dir);
                     }
@@ -405,8 +409,9 @@ impl App {
     }
 }
 
-/// 큰 폴더 영역 + 선택 버튼을 그린다. 폴더 선택 버튼이 눌리면 true 반환.
-/// `armed`이면(=드롭 대상으로 선택된 영역) 파란 테두리로 강조.
+/// 큰 폴더 박스를 그린다.
+/// 반환: (박스 영역이 클릭됨 = 드롭 대상으로 지정해야 함, "폴더 선택" 버튼이 눌림)
+/// `armed`이면(=현재 드롭 대상) 파란 테두리로 강조.
 fn drop_zone(
     ui: &mut egui::Ui,
     height: f32,
@@ -415,50 +420,55 @@ fn drop_zone(
     hint: &str,
     enabled: bool,
     armed: bool,
-) -> bool {
-    let mut select_clicked = false;
+) -> (bool, bool) {
+    let size = egui::vec2(ui.available_width(), height);
+    // 배경 영역을 먼저 할당(낮은 우선순위) → 위에 그릴 버튼이 클릭을 가져감.
+    let (rect, bg) = ui.allocate_exact_size(size, egui::Sense::click());
 
-    let frame = egui::Frame::group(ui.style())
-        .stroke(if armed {
-            egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 170, 255))
-        } else {
-            ui.visuals().widgets.noninteractive.bg_stroke
-        })
-        .fill(if armed {
-            egui::Color32::from_rgb(30, 45, 65)
-        } else {
-            ui.visuals().extreme_bg_color
-        });
+    let (fill, stroke) = if armed {
+        (
+            egui::Color32::from_rgb(30, 45, 65),
+            egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 170, 255)),
+        )
+    } else {
+        (
+            ui.visuals().extreme_bg_color,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        )
+    };
+    ui.painter().rect(rect, 6.0, fill, stroke);
 
-    frame.show(ui, |ui| {
-        ui.set_min_height(height);
-        ui.set_min_width(ui.available_width());
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
-                ui.heading(title);
-                if armed {
-                    ui.colored_label(egui::Color32::from_rgb(90, 170, 255), "⬇ 드롭 대상");
-                }
-                ui.add_space(8.0);
-                if ui.button("📂 폴더 선택").clicked() {
-                    select_clicked = true;
-                }
-                ui.add_space(10.0);
-                match current {
-                    Some(p) => {
-                        ui.strong("선택됨:");
-                        ui.label(p.display().to_string());
-                    }
-                    None => {
-                        ui.weak(hint);
-                    }
-                }
-            });
-        });
+    let mut pick = false;
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(12.0))
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    content.add_enabled_ui(enabled, |ui| {
+        ui.add_space(6.0);
+        ui.heading(title);
+        if armed {
+            ui.colored_label(egui::Color32::from_rgb(90, 170, 255), "⬇ 드롭 대상");
+        } else if enabled {
+            ui.weak("(클릭하면 드롭 대상)");
+        }
+        ui.add_space(8.0);
+        if ui.button("📂 폴더 선택").clicked() {
+            pick = true;
+        }
+        ui.add_space(10.0);
+        match current {
+            Some(p) => {
+                ui.strong("선택됨:");
+                ui.label(p.display().to_string());
+            }
+            None => {
+                ui.weak(hint);
+            }
+        }
     });
 
-    select_clicked
+    (enabled && bg.clicked(), pick)
 }
 
 /// 한글이 깨지지 않도록 시스템 한글 폰트를 egui에 등록.
