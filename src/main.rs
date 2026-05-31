@@ -54,9 +54,16 @@ struct App {
     job: Option<Job>,
     log: Vec<String>,
     summary: Option<String>,
-    // 드롭 영역 판정을 위한 직전 프레임 사각형.
-    input_rect: Option<egui::Rect>,
-    output_rect: Option<egui::Rect>,
+    // 끌어다 놓은 폴더가 들어갈 대상 (Windows는 드롭 좌표를 못 주므로 명시 선택).
+    drop_target: Zone,
+}
+
+/// 드롭 영역 종류.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Zone {
+    #[default]
+    Input,
+    Output,
 }
 
 /// OutputFormat 기본값 래퍼 (Default 구현용).
@@ -74,7 +81,6 @@ impl eframe::App for App {
 
         let running = self.job.is_some();
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let pointer = ctx.input(|i| i.pointer.hover_pos());
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
@@ -82,52 +88,67 @@ impl eframe::App for App {
             ui.label("폴더 안의 모든 음원을 WAV로 변환합니다. (하위 폴더 구조 그대로 복제)");
             ui.add_space(10.0);
 
-            // ===== 좌우 큰 드롭 영역 =====
-            let zone_height = 150.0;
+            // 원본 대체 모드에서는 드롭 대상을 입력으로 강제.
+            if self.same_as_input {
+                self.drop_target = Zone::Input;
+            }
+
+            // ===== 끌어다 놓기 대상 선택 =====
+            ui.horizontal(|ui| {
+                ui.label("끌어다 놓기 대상:");
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.radio_value(&mut self.drop_target, Zone::Input, "📥 입력 폴더");
+                    ui.add_enabled_ui(!self.same_as_input, |ui| {
+                        ui.radio_value(&mut self.drop_target, Zone::Output, "💾 출력 폴더");
+                    });
+                });
+            });
+            ui.small(if hovering_files {
+                "⬇ 지금 놓으면 위에서 선택한 대상으로 들어갑니다."
+            } else {
+                "폴더를 창에 끌어다 놓으면 선택한 대상으로 지정됩니다. (또는 각 박스의 버튼 사용)"
+            });
+
+            ui.add_space(6.0);
+
+            // ===== 좌우 큰 영역 =====
+            let zone_height = 140.0;
             ui.columns(2, |cols| {
                 // --- 왼쪽: 입력 폴더 ---
-                let resp = drop_zone(
+                if drop_zone(
                     &mut cols[0],
                     zone_height,
                     "📥 입력 폴더",
                     &self.input_dir,
-                    "여기로 폴더를 끌어다 놓으세요\n(또는 아래 버튼)",
+                    "(폴더를 선택하거나 끌어다 놓으세요)",
                     !running,
-                    hovering_files,
-                    pointer,
-                    self.input_rect,
-                );
-                if resp.select_clicked {
+                    self.drop_target == Zone::Input,
+                ) {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.input_dir = Some(dir);
                     }
                 }
-                self.input_rect = Some(resp.rect);
 
                 // --- 오른쪽: 출력 폴더 ---
                 let out_enabled = !running && !self.same_as_input;
                 let out_hint = if self.same_as_input {
                     "원본 대체 모드 — 출력 폴더 사용 안 함"
                 } else {
-                    "여기로 폴더를 끌어다 놓으세요\n(또는 아래 버튼)"
+                    "(폴더를 선택하거나 끌어다 놓으세요)"
                 };
-                let resp = drop_zone(
+                if drop_zone(
                     &mut cols[1],
                     zone_height,
                     "💾 출력 폴더",
                     &self.output_dir,
                     out_hint,
                     out_enabled,
-                    hovering_files && !self.same_as_input,
-                    pointer,
-                    self.output_rect,
-                );
-                if resp.select_clicked {
+                    !self.same_as_input && self.drop_target == Zone::Output,
+                ) {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         self.output_dir = Some(dir);
                     }
                 }
-                self.output_rect = Some(resp.rect);
             });
 
             ui.add_space(10.0);
@@ -231,7 +252,7 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// 드래그&드롭으로 들어온 폴더를 — 떨어뜨린 위치에 따라 — 입력/출력으로 설정.
+    /// 드래그&드롭으로 들어온 폴더를, 선택된 드롭 대상(입력/출력)으로 설정.
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         if self.job.is_some() {
             return;
@@ -251,24 +272,10 @@ impl App {
         });
         let Some(folder) = folder else { return };
 
-        // 떨어뜨린 위치로 영역 판정.
-        let pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
-        let on_output = match (pos, self.output_rect) {
-            (Some(p), Some(r)) => r.contains(p),
-            _ => false,
-        };
-        let on_input = match (pos, self.input_rect) {
-            (Some(p), Some(r)) => r.contains(p),
-            _ => false,
-        };
-
-        if on_output && !self.same_as_input {
-            self.output_dir = Some(folder);
-        } else if on_input {
-            self.input_dir = Some(folder);
-        } else {
-            // 영역 밖이면 입력으로 기본 처리.
-            self.input_dir = Some(folder);
+        // Windows는 드롭 좌표를 주지 않으므로, 사용자가 고른 대상으로 배치.
+        match self.drop_target {
+            Zone::Output if !self.same_as_input => self.output_dir = Some(folder),
+            _ => self.input_dir = Some(folder),
         }
     }
 
@@ -398,14 +405,8 @@ impl App {
     }
 }
 
-/// 드롭존 위젯의 반환값.
-struct ZoneResp {
-    rect: egui::Rect,
-    select_clicked: bool,
-}
-
-/// 큰 드롭 영역 + 폴더 선택 버튼을 그린다.
-#[allow(clippy::too_many_arguments)]
+/// 큰 폴더 영역 + 선택 버튼을 그린다. 폴더 선택 버튼이 눌리면 true 반환.
+/// `armed`이면(=드롭 대상으로 선택된 영역) 파란 테두리로 강조.
 fn drop_zone(
     ui: &mut egui::Ui,
     height: f32,
@@ -413,40 +414,33 @@ fn drop_zone(
     current: &Option<PathBuf>,
     hint: &str,
     enabled: bool,
-    hovering_files: bool,
-    pointer: Option<egui::Pos2>,
-    prev_rect: Option<egui::Rect>,
-) -> ZoneResp {
-    // 이 영역 위로 파일을 드래그 중이면 강조.
-    let highlighted = enabled
-        && hovering_files
-        && match (pointer, prev_rect) {
-            (Some(p), Some(r)) => r.contains(p),
-            _ => false,
-        };
-
+    armed: bool,
+) -> bool {
     let mut select_clicked = false;
 
     let frame = egui::Frame::group(ui.style())
-        .stroke(if highlighted {
+        .stroke(if armed {
             egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 170, 255))
         } else {
             ui.visuals().widgets.noninteractive.bg_stroke
         })
-        .fill(if highlighted {
+        .fill(if armed {
             egui::Color32::from_rgb(30, 45, 65)
         } else {
             ui.visuals().extreme_bg_color
         });
 
-    let inner = frame.show(ui, |ui| {
+    frame.show(ui, |ui| {
         ui.set_min_height(height);
         ui.set_min_width(ui.available_width());
         ui.add_enabled_ui(enabled, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
                 ui.heading(title);
-                ui.add_space(10.0);
+                if armed {
+                    ui.colored_label(egui::Color32::from_rgb(90, 170, 255), "⬇ 드롭 대상");
+                }
+                ui.add_space(8.0);
                 if ui.button("📂 폴더 선택").clicked() {
                     select_clicked = true;
                 }
@@ -464,10 +458,7 @@ fn drop_zone(
         });
     });
 
-    ZoneResp {
-        rect: inner.response.rect,
-        select_clicked,
-    }
+    select_clicked
 }
 
 /// 한글이 깨지지 않도록 시스템 한글 폰트를 egui에 등록.
