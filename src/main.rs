@@ -19,7 +19,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        concat!("WAV 일괄 변환기  v", env!("CARGO_PKG_VERSION"), " (pos-drop)"),
+        concat!("WAV 일괄 변환기  v", env!("CARGO_PKG_VERSION"), " (drag-hl)"),
         native_options,
         Box::new(|cc| {
             install_korean_font(&cc.egui_ctx);
@@ -59,8 +59,6 @@ struct App {
     // 직전 프레임의 박스 영역 (드롭 위치 판정용).
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
-    // 마지막 드롭 판정 결과 (진단용 표시).
-    last_drop_info: Option<String>,
 }
 
 /// 드롭 영역 종류.
@@ -94,6 +92,18 @@ impl eframe::App for App {
         let running = self.job.is_some();
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
+        // 파일을 드래그하는 동안: OS에서 커서 위치를 매 프레임 조회해 박스 강조.
+        let drag_cursor = if hovering_files {
+            ctx.request_repaint(); // 드래그 중 계속 다시 그려 커서를 추적.
+            os_cursor_in_points(ctx, frame)
+        } else {
+            None
+        };
+        let hot_input =
+            drag_cursor.is_some_and(|p| self.input_rect.is_some_and(|r| r.contains(p)));
+        let hot_output = !self.same_as_input
+            && drag_cursor.is_some_and(|p| self.output_rect.is_some_and(|r| r.contains(p)));
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -101,7 +111,7 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 ui.colored_label(
                     egui::Color32::from_rgb(120, 200, 120),
-                    concat!("v", env!("CARGO_PKG_VERSION"), " (pos-drop)"),
+                    concat!("v", env!("CARGO_PKG_VERSION"), " (drag-hl)"),
                 );
             });
             ui.label("폴더 안의 모든 음원을 WAV로 변환합니다. (하위 폴더 구조 그대로 복제)");
@@ -118,10 +128,6 @@ impl eframe::App for App {
             } else {
                 "폴더를 원하는 박스 위로 끌어다 놓으세요. (또는 박스 안 📂 버튼으로 선택)"
             });
-            // 진단: 마지막 드롭이 어떻게 판정됐는지.
-            if let Some(info) = &self.last_drop_info {
-                ui.colored_label(egui::Color32::from_rgb(180, 180, 90), info);
-            }
 
             ui.add_space(6.0);
 
@@ -136,7 +142,7 @@ impl eframe::App for App {
                     &self.input_dir,
                     "(폴더를 끌어다 놓거나 버튼으로 선택)",
                     !running,
-                    self.drop_target == Zone::Input,
+                    hot_input,
                 );
                 self.input_rect = Some(rect);
                 if clicked {
@@ -163,7 +169,7 @@ impl eframe::App for App {
                     &self.output_dir,
                     out_hint,
                     out_enabled,
-                    !self.same_as_input && self.drop_target == Zone::Output,
+                    hot_output,
                 );
                 self.output_rect = Some(rect);
                 if clicked {
@@ -312,24 +318,6 @@ impl App {
             self.drop_target
         };
 
-        // 진단용: 어떻게 판정됐는지 기록.
-        let pos_txt = match drop_pos {
-            Some(p) => format!("({:.0}, {:.0})", p.x, p.y),
-            None => "위치없음".to_string(),
-        };
-        let how = if on_output || on_input {
-            "위치"
-        } else {
-            "클릭폴백"
-        };
-        self.last_drop_info = Some(format!(
-            "마지막 드롭: pos={pos_txt} → {} ({how})",
-            match target {
-                Zone::Input => "입력",
-                Zone::Output => "출력",
-            }
-        ));
-
         match target {
             Zone::Output if !self.same_as_input => self.output_dir = Some(folder),
             _ => self.input_dir = Some(folder),
@@ -464,7 +452,7 @@ impl App {
 
 /// 큰 폴더 박스를 그린다.
 /// 반환: (박스 사각형, 박스 영역 클릭됨, "폴더 선택" 버튼 눌림)
-/// `armed`이면(=현재 드롭 대상) 파란 테두리로 강조.
+/// `highlight`이면(=드래그 중 커서가 이 박스 위) 파란 테두리로 강조.
 fn drop_zone(
     ui: &mut egui::Ui,
     height: f32,
@@ -472,13 +460,13 @@ fn drop_zone(
     current: &Option<PathBuf>,
     hint: &str,
     enabled: bool,
-    armed: bool,
+    highlight: bool,
 ) -> (egui::Rect, bool, bool) {
     let size = egui::vec2(ui.available_width(), height);
     // 배경 영역을 먼저 할당(낮은 우선순위) → 위에 그릴 버튼이 클릭을 가져감.
     let (rect, bg) = ui.allocate_exact_size(size, egui::Sense::click());
 
-    let (fill, stroke) = if armed {
+    let (fill, stroke) = if highlight {
         (
             egui::Color32::from_rgb(30, 45, 65),
             egui::Stroke::new(2.5, egui::Color32::from_rgb(90, 170, 255)),
@@ -500,10 +488,8 @@ fn drop_zone(
     content.add_enabled_ui(enabled, |ui| {
         ui.add_space(6.0);
         ui.heading(title);
-        if armed {
-            ui.colored_label(egui::Color32::from_rgb(90, 170, 255), "⬇ 드롭 대상");
-        } else if enabled {
-            ui.weak("(클릭하면 드롭 대상)");
+        if highlight {
+            ui.colored_label(egui::Color32::from_rgb(90, 170, 255), "⬇ 여기에 놓기");
         }
         ui.add_space(8.0);
         if ui.button("📂 폴더 선택").clicked() {

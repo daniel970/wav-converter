@@ -1,6 +1,6 @@
 [package]
 name = "wav-converter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "음원 파일을 일괄로 WAV로 변환하는 GUI 도구 (Windows)"
 
