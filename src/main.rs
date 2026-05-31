@@ -19,7 +19,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "WAV 일괄 변환기",
+        concat!("WAV 일괄 변환기  v", env!("CARGO_PKG_VERSION"), " (pos-drop)"),
         native_options,
         Box::new(|cc| {
             install_korean_font(&cc.egui_ctx);
@@ -59,6 +59,8 @@ struct App {
     // 직전 프레임의 박스 영역 (드롭 위치 판정용).
     input_rect: Option<egui::Rect>,
     output_rect: Option<egui::Rect>,
+    // 마지막 드롭 판정 결과 (진단용 표시).
+    last_drop_info: Option<String>,
 }
 
 /// 드롭 영역 종류.
@@ -94,7 +96,14 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
-            ui.heading("🎵 WAV 일괄 변환기");
+            ui.horizontal(|ui| {
+                ui.heading("🎵 WAV 일괄 변환기");
+                ui.add_space(6.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 200, 120),
+                    concat!("v", env!("CARGO_PKG_VERSION"), " (pos-drop)"),
+                );
+            });
             ui.label("폴더 안의 모든 음원을 WAV로 변환합니다. (하위 폴더 구조 그대로 복제)");
             ui.add_space(10.0);
 
@@ -109,6 +118,10 @@ impl eframe::App for App {
             } else {
                 "폴더를 원하는 박스 위로 끌어다 놓으세요. (또는 박스 안 📂 버튼으로 선택)"
             });
+            // 진단: 마지막 드롭이 어떻게 판정됐는지.
+            if let Some(info) = &self.last_drop_info {
+                ui.colored_label(egui::Color32::from_rgb(180, 180, 90), info);
+            }
 
             ui.add_space(6.0);
 
@@ -298,6 +311,24 @@ impl App {
             // 위치를 못 얻었거나 박스 밖 → 클릭으로 고른 대상.
             self.drop_target
         };
+
+        // 진단용: 어떻게 판정됐는지 기록.
+        let pos_txt = match drop_pos {
+            Some(p) => format!("({:.0}, {:.0})", p.x, p.y),
+            None => "위치없음".to_string(),
+        };
+        let how = if on_output || on_input {
+            "위치"
+        } else {
+            "클릭폴백"
+        };
+        self.last_drop_info = Some(format!(
+            "마지막 드롭: pos={pos_txt} → {} ({how})",
+            match target {
+                Zone::Input => "입력",
+                Zone::Output => "출력",
+            }
+        ));
 
         match target {
             Zone::Output if !self.same_as_input => self.output_dir = Some(folder),
