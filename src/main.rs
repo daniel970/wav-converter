@@ -54,8 +54,11 @@ struct App {
     job: Option<Job>,
     log: Vec<String>,
     summary: Option<String>,
-    // 끌어다 놓은 폴더가 들어갈 대상 (Windows는 드롭 좌표를 못 주므로 명시 선택).
+    // 끌어다 놓은 폴더가 들어갈 대상 (클릭으로 고정 / 위치 판정 실패 시 폴백).
     drop_target: Zone,
+    // 직전 프레임의 박스 영역 (드롭 위치 판정용).
+    input_rect: Option<egui::Rect>,
+    output_rect: Option<egui::Rect>,
 }
 
 /// 드롭 영역 종류.
@@ -75,8 +78,15 @@ impl Default for Format {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_dropped_files(ctx);
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 드롭된 파일이 있으면 OS에서 마우스 좌표를 직접 조회(Windows)해 위치 판정.
+        let has_drop = ctx.input(|i| !i.raw.dropped_files.is_empty());
+        let drop_pos = if has_drop {
+            os_cursor_in_points(ctx, frame)
+        } else {
+            None
+        };
+        self.handle_dropped_files(ctx, drop_pos);
         self.pump_messages(ctx);
 
         let running = self.job.is_some();
@@ -95,12 +105,9 @@ impl eframe::App for App {
 
             // ===== 안내 =====
             ui.small(if hovering_files {
-                match self.drop_target {
-                    Zone::Input => "⬇ 지금 놓으면 [입력 폴더]로 들어갑니다.",
-                    Zone::Output => "⬇ 지금 놓으면 [출력 폴더]로 들어갑니다.",
-                }
+                "⬇ 원하는 박스 위에 놓으세요."
             } else {
-                "박스를 클릭해 드롭 대상(파란 테두리)을 고른 뒤, 폴더를 창에 끌어다 놓으세요. (또는 박스 안 버튼으로 직접 선택)"
+                "폴더를 원하는 박스 위로 끌어다 놓으세요. (또는 박스 안 📂 버튼으로 선택)"
             });
 
             ui.add_space(6.0);
@@ -109,15 +116,16 @@ impl eframe::App for App {
             let zone_height = 150.0;
             ui.columns(2, |cols| {
                 // --- 왼쪽: 입력 폴더 ---
-                let (clicked, pick) = drop_zone(
+                let (rect, clicked, pick) = drop_zone(
                     &mut cols[0],
                     zone_height,
                     "📥 입력 폴더",
                     &self.input_dir,
-                    "(폴더를 선택하거나 끌어다 놓으세요)",
+                    "(폴더를 끌어다 놓거나 버튼으로 선택)",
                     !running,
                     self.drop_target == Zone::Input,
                 );
+                self.input_rect = Some(rect);
                 if clicked {
                     self.drop_target = Zone::Input;
                 }
@@ -133,9 +141,9 @@ impl eframe::App for App {
                 let out_hint = if self.same_as_input {
                     "원본 대체 모드 — 출력 폴더 사용 안 함"
                 } else {
-                    "(폴더를 선택하거나 끌어다 놓으세요)"
+                    "(폴더를 끌어다 놓거나 버튼으로 선택)"
                 };
-                let (clicked, pick) = drop_zone(
+                let (rect, clicked, pick) = drop_zone(
                     &mut cols[1],
                     zone_height,
                     "💾 출력 폴더",
@@ -144,6 +152,7 @@ impl eframe::App for App {
                     out_enabled,
                     !self.same_as_input && self.drop_target == Zone::Output,
                 );
+                self.output_rect = Some(rect);
                 if clicked {
                     self.drop_target = Zone::Output;
                 }
@@ -256,8 +265,10 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// 드래그&드롭으로 들어온 폴더를, 선택된 드롭 대상(입력/출력)으로 설정.
-    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+    /// 드래그&드롭으로 들어온 폴더를 배치한다.
+    /// `drop_pos`(OS에서 조회한 마우스 좌표)가 어느 박스 위면 그 박스로,
+    /// 못 얻었거나 박스 밖이면 클릭으로 고른 대상(`drop_target`)으로.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context, drop_pos: Option<egui::Pos2>) {
         if self.job.is_some() {
             return;
         }
@@ -276,8 +287,19 @@ impl App {
         });
         let Some(folder) = folder else { return };
 
-        // Windows는 드롭 좌표를 주지 않으므로, 사용자가 고른 대상으로 배치.
-        match self.drop_target {
+        let on_output = drop_pos.is_some_and(|p| self.output_rect.is_some_and(|r| r.contains(p)));
+        let on_input = drop_pos.is_some_and(|p| self.input_rect.is_some_and(|r| r.contains(p)));
+
+        let target = if on_output {
+            Zone::Output
+        } else if on_input {
+            Zone::Input
+        } else {
+            // 위치를 못 얻었거나 박스 밖 → 클릭으로 고른 대상.
+            self.drop_target
+        };
+
+        match target {
             Zone::Output if !self.same_as_input => self.output_dir = Some(folder),
             _ => self.input_dir = Some(folder),
         }
@@ -410,7 +432,7 @@ impl App {
 }
 
 /// 큰 폴더 박스를 그린다.
-/// 반환: (박스 영역이 클릭됨 = 드롭 대상으로 지정해야 함, "폴더 선택" 버튼이 눌림)
+/// 반환: (박스 사각형, 박스 영역 클릭됨, "폴더 선택" 버튼 눌림)
 /// `armed`이면(=현재 드롭 대상) 파란 테두리로 강조.
 fn drop_zone(
     ui: &mut egui::Ui,
@@ -420,7 +442,7 @@ fn drop_zone(
     hint: &str,
     enabled: bool,
     armed: bool,
-) -> (bool, bool) {
+) -> (egui::Rect, bool, bool) {
     let size = egui::vec2(ui.available_width(), height);
     // 배경 영역을 먼저 할당(낮은 우선순위) → 위에 그릴 버튼이 클릭을 가져감.
     let (rect, bg) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -468,7 +490,41 @@ fn drop_zone(
         }
     });
 
-    (enabled && bg.clicked(), pick)
+    (rect, enabled && bg.clicked(), pick)
+}
+
+/// 드롭된 파일의 마우스 위치를 egui 좌표(points)로 조회.
+/// Windows에서는 OS API(`GetCursorPos`+`ScreenToClient`)로 직접 얻는다.
+/// (winit이 드래그 중 좌표를 제공하지 않기 때문)
+#[cfg(windows)]
+fn os_cursor_in_points(ctx: &egui::Context, frame: &eframe::Frame) -> Option<egui::Pos2> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let hwnd: HWND = match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => h.hwnd.get() as HWND,
+        _ => return None,
+    };
+
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut pt) == 0 {
+            return None;
+        }
+        if ScreenToClient(hwnd, &mut pt) == 0 {
+            return None;
+        }
+    }
+    let ppp = ctx.pixels_per_point();
+    Some(egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp))
+}
+
+/// 비 Windows에서는 위치를 못 얻으므로 None (클릭 선택으로 폴백).
+#[cfg(not(windows))]
+fn os_cursor_in_points(_ctx: &egui::Context, _frame: &eframe::Frame) -> Option<egui::Pos2> {
+    None
 }
 
 /// 한글이 깨지지 않도록 시스템 한글 폰트를 egui에 등록.

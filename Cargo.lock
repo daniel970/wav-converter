@@ -3700,10 +3700,12 @@ dependencies = [
  "anyhow",
  "eframe",
  "hound",
+ "raw-window-handle",
  "rfd",
  "rubato",
  "symphonia",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

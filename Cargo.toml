@@ -25,6 +25,15 @@ rubato = "0.16"
 walkdir = "2"
 anyhow = "1"
 
+# Windows 전용: 드래그&드롭 시 OS에서 마우스 좌표 직접 조회.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
 [dev-dependencies]
 hound = "3.5"
 
