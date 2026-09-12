@@ -56,7 +56,12 @@ fn main() -> eframe::Result<()> {
         ));
         previous_hook(info);
     }));
-    diagnostic("APP START");
+    diagnostic(&format!(
+        "APP START version={} pid={} exe={:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        std::env::current_exe()
+    ));
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 620.0])
@@ -88,6 +93,7 @@ enum Msg {
     Finished { ok: usize, failed: usize },
     OrderError(String),
     NameWarning(String),
+    OutputWarning(String),
 }
 
 /// 진행 중인 변환 작업 상태.
@@ -110,6 +116,7 @@ struct App {
     disable_track_prefix: bool,
     disable_ordering: bool,
     filename_warning: Option<String>,
+    output_warning: Option<String>,
     job: Option<Job>,
     log: VecDeque<String>,
     summary: Option<String>,
@@ -280,18 +287,29 @@ impl App {
             });
             ui.add_enabled_ui(!running, |ui| {
                 let mut enabled = !self.disable_ordering;
-                ui.checkbox(&mut enabled, "DAP 재생 순서 맞추기 (변환 후 출력 폴더·곡을 번호순으로 정리)");
+                ui.checkbox(
+                    &mut enabled,
+                    "DAP 재생 순서 맞추기 (변환 후 출력 폴더·곡을 번호순으로 정리)",
+                );
                 self.disable_ordering = !enabled;
             });
             ui.add_enabled_ui(!running, |ui| {
                 let mut enabled = !self.disable_track_prefix;
-                ui.checkbox(&mut enabled, "번호 없는 파일명 앞에 트랙 번호(#) 붙이기 (1. 곡제목)");
+                ui.checkbox(
+                    &mut enabled,
+                    "번호 없는 파일명 앞에 트랙 번호(#) 붙이기 (1. 곡제목)",
+                );
                 self.disable_track_prefix = !enabled;
             });
-            ui.small("DAP용 순서는 출력 위치에 적용됩니다. 카드로 직접 출력하면 복사 순서의 영향을 피할 수 있습니다.");
+            ui.small(
+                "순서 정리는 실제 저장 폴더에 적용됩니다. DAP에서 해당 폴더를 열어 재생하세요.",
+            );
             if !self.same_as_input {
                 if let Some(selected) = &self.output_dir {
-                    ui.small(format!("실제 저장 위치: {}", effective_output_dir(selected, !self.disable_ordering).display()));
+                    ui.small(format!(
+                        "실제 저장 위치: {}",
+                        effective_output_dir(selected, !self.disable_ordering).display()
+                    ));
                 }
             }
             ui.horizontal(|ui| {
@@ -388,6 +406,26 @@ impl App {
                 self.filename_warning = None;
             }
         }
+        if let Some(message) = &self.output_warning {
+            let mut close = false;
+            egui::Window::new("⚠ 작업 결과 확인")
+                .id(egui::Id::new("output_warning"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .order(egui::Order::Foreground)
+                .collapsible(false)
+                .default_width(500.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            ui.label(message);
+                        });
+                    close = ui.button("확인").clicked();
+                });
+            if close {
+                self.output_warning = None;
+            }
+        }
     }
 }
 
@@ -450,19 +488,40 @@ impl App {
                         }
                     }
                     Ok(Msg::Finished { ok, failed }) => {
-                        self.summary = Some(format!("✅ 완료 — 성공 {ok}개, 실패 {failed}개"));
+                        self.summary = Some(if ok == 0 && failed == 0 {
+                            "변환할 음원이 없습니다.".to_owned()
+                        } else if failed == 0 {
+                            format!("✅ 완료 — 성공 {ok}개, 실패 {failed}개")
+                        } else {
+                            format!("⚠ 일부 변환 실패 — 성공 {ok}개, 실패 {failed}개")
+                        });
                         if let Some(error) = &job.order_error {
                             self.summary = Some(format!(
                                 "변환 성공 {ok}개, 실패 {failed}개 · 순서 정리 실패: {error}"
                             ));
                         }
+                        if failed > 0 || job.order_error.is_some() {
+                            let message = format!(
+                                "{}\n전체 작업이 성공한 상태가 아닙니다. 아래 파일별 오류 기록을 확인하세요.",
+                                self.summary.as_deref().unwrap_or_default()
+                            );
+                            self.output_warning = Some(match self.output_warning.take() {
+                                Some(previous) => format!("{message}\n\n{previous}"),
+                                None => message,
+                            });
+                        }
                         if !cfg!(test) {
-                            let message = wav_converter::notification::completion_message(
+                            let mut message = wav_converter::notification::completion_message(
                                 ok,
                                 failed,
                                 job.order_error.is_some(),
                                 self.filename_warning.is_some(),
                             );
+                            if self.output_warning.is_some() {
+                                message.push_str(
+                                    "\n작업 결과 경고가 있습니다. 프로그램을 확인해 주세요.",
+                                );
+                            }
                             thread::spawn(move || {
                                 if let Err(error) =
                                     wav_converter::notification::show_completion(&message)
@@ -481,6 +540,7 @@ impl App {
                         job.order_error = Some(error);
                     }
                     Ok(Msg::NameWarning(message)) => self.filename_warning = Some(message),
+                    Ok(Msg::OutputWarning(message)) => self.output_warning = Some(message),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         let message =
@@ -505,10 +565,14 @@ impl App {
     /// 변환 작업 시작 (파일 목록을 먼저 수집 후 스레드 실행).
     fn start_job(&mut self, ctx: &egui::Context) {
         let input = self.input_dir.clone().unwrap();
-        let output = self
-            .output_dir
-            .as_ref()
-            .map(|p| effective_output_dir(p, !self.disable_ordering));
+        let selected_output = self.output_dir.clone();
+        let output = if self.same_as_input {
+            Some(input.clone())
+        } else {
+            self.output_dir
+                .as_ref()
+                .map(|p| effective_output_dir(p, !self.disable_ordering))
+        };
         let fmt = self.format.0;
         let in_place = self.same_as_input;
         let remove_artist = self.remove_artist;
@@ -518,6 +582,7 @@ impl App {
         self.log.clear();
         self.summary = None;
         self.filename_warning = None;
+        self.output_warning = None;
         self.log.push_back(format!("입력: {}", input.display()));
         if in_place {
             self.log.push_back("모드: 원본 대체 (in-place)".to_string());
@@ -526,7 +591,9 @@ impl App {
         }
 
         diagnostic(&format!(
-            "JOB input={} output={output:?} format={fmt:?} in_place={in_place} remove_artist={remove_artist} arrange={arrange}",
+            "JOB version={} pid={} input={} selected_output={selected_output:?} effective_output={output:?} format={fmt:?} in_place={in_place} remove_artist={remove_artist} arrange={arrange} track_prefix={use_track_number}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
             input.display()
         ));
         self.log
@@ -535,20 +602,43 @@ impl App {
         let ctx2 = ctx.clone();
 
         thread::spawn(move || {
+            if !in_place {
+                if let (Some(selected), Some(effective)) = (&selected_output, &output) {
+                    match outside_output_warning(selected, effective) {
+                        Ok(Some(warning)) => {
+                            diagnostic(&format!("OUTPUT WARNING: {warning}"));
+                            let _ = tx.send(Msg::Log(format!("⚠ {warning}")));
+                            let _ = tx.send(Msg::OutputWarning(warning));
+                        }
+                        Err(error) => {
+                            diagnostic(&format!("OUTPUT INSPECTION ERROR: {error}"));
+                            let _ = tx.send(Msg::Log(format!("⚠ 기존 출력 확인 실패: {error}")));
+                        }
+                        Ok(None) => {}
+                    }
+                }
+            }
             // 대상 파일 목록을 미리 고정 (출력이 입력 하위에 있어도 무한 재귀 방지).
-            let files: Vec<PathBuf> = WalkDir::new(&input)
-                .sort_by(|a, b| {
-                    natural_cmp(
-                        &a.file_name().to_string_lossy(),
-                        &b.file_name().to_string_lossy(),
-                    )
-                })
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.into_path())
-                .filter(|p| is_audio_file(p))
-                .collect();
+            let mut files = Vec::new();
+            let mut failed = 0usize;
+            for entry in WalkDir::new(&input).sort_by(|a, b| {
+                natural_cmp(
+                    &a.file_name().to_string_lossy(),
+                    &b.file_name().to_string_lossy(),
+                )
+            }) {
+                match entry {
+                    Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
+                        files.push(entry.into_path());
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        diagnostic(&format!("SCAN ERROR: {error}"));
+                        let _ = tx.send(Msg::Log(format!("⚠ 입력 탐색 실패: {error}")));
+                    }
+                    _ => {}
+                }
+            }
 
             let _ = tx.send(Msg::Total(files.len()));
             ctx2.request_repaint();
@@ -582,7 +672,6 @@ impl App {
             plans.sort_by(|a, b| natural_cmp(&a.1.to_string_lossy(), &b.1.to_string_lossy()));
 
             let mut ok = 0usize;
-            let mut failed = 0usize;
             let mut completed_paths = Vec::new();
 
             for (i, (file, relative)) in plans.iter().enumerate() {
@@ -599,20 +688,33 @@ impl App {
                 ctx2.request_repaint();
 
                 // 파일 하나가 패닉을 일으켜도 전체 작업이 죽지 않도록 격리.
-                diagnostic(&format!("FILE START: {}", file.display()));
+                let destination = if in_place {
+                    &input
+                } else {
+                    output.as_ref().unwrap()
+                }
+                .join(relative);
+                diagnostic(&format!(
+                    "FILE START: {} -> {}",
+                    file.display(),
+                    destination.display()
+                ));
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     if in_place {
-                        convert_in_place_to(file, &input.join(relative), fmt)
+                        convert_in_place_to(file, &destination, fmt)
                     } else {
-                        let out_path = output.as_ref().unwrap().join(relative);
-                        convert_file(file, &out_path, fmt)
+                        convert_file(file, &destination, fmt)
                     }
                 }));
 
                 match result {
                     Ok(Ok(())) => {
                         completed_paths.push(relative.clone());
-                        diagnostic(&format!("FILE OK: {}", file.display()));
+                        diagnostic(&format!(
+                            "FILE OK: {} -> {}",
+                            file.display(),
+                            destination.display()
+                        ));
                         ok += 1;
                         let _ = tx.send(Msg::Log(format!("✓ {rel} → {}", relative.display())));
                     }
@@ -630,27 +732,54 @@ impl App {
                 ctx2.request_repaint();
             }
 
-            if arrange && !files.is_empty() {
+            if arrange && !completed_paths.is_empty() {
                 let root = if in_place {
                     &input
                 } else {
                     output.as_ref().unwrap()
                 };
-                let destinations: Vec<_> = plans
+                let destinations: Vec<_> = completed_paths
                     .iter()
-                    .map(|(_, relative)| root.join(relative))
+                    .map(|relative| root.join(relative))
                     .collect();
                 let _ = tx.send(Msg::Log("DAP 재생 순서 정리 중…".to_owned()));
                 ctx2.request_repaint();
                 match arrange_output(root, &destinations) {
                     Ok(report) => {
                         let message = if report.physical_order_verified {
-                            "✓ 카드의 실제 폴더·곡 순서 검증 완료"
+                            format!(
+                                "✓ 저장 폴더 {}개에서 Windows가 읽은 목록이 번호순임을 확인: {}",
+                                report.checked_directories.len(),
+                                root.display()
+                            )
                         } else {
-                            "✓ 출력 폴더 재구성 완료 (카드로 복사하는 순서는 별도 적용)"
+                            format!(
+                                "✓ 출력 폴더 재구성 완료: {} (DAP 재생 순서는 확인하지 않음)",
+                                root.display()
+                            )
                         };
-                        diagnostic(message);
-                        let _ = tx.send(Msg::Log(message.to_owned()));
+                        diagnostic(&message);
+                        let _ = tx.send(Msg::Log(message));
+                        for (directory, entries) in report.checked_directories {
+                            diagnostic(&format!(
+                                "ORDER SNAPSHOT directory={} entries={entries:?}",
+                                directory.display()
+                            ));
+                            let preview = entries
+                                .iter()
+                                .take(12)
+                                .map(|name| name.to_string_lossy())
+                                .collect::<Vec<_>>()
+                                .join(" → ");
+                            let _ = tx.send(Msg::Log(format!(
+                                "목록 {}: {preview}{}",
+                                directory.display(),
+                                if entries.len() > 12 { " → …" } else { "" }
+                            )));
+                        }
+                        if failed > 0 {
+                            let _ = tx.send(Msg::Log(format!("⚠ 성공한 결과의 저장 폴더만 정리했습니다. 실패 {failed}개는 다시 변환해야 합니다.")));
+                        }
                     }
                     Err(error) => {
                         diagnostic(&format!("ORDER ERROR: {error:#}"));
@@ -658,7 +787,7 @@ impl App {
                     }
                 }
             }
-            diagnostic(&format!("JOB FINISHED: ok={ok} failed={failed}"));
+            diagnostic(&format!("JOB FINISHED: ok={ok} failed={failed} effective_output={output:?} in_place={in_place}"));
             if let Some(warning) = filename_warning(&completed_paths) {
                 for path in &completed_paths {
                     if !path.to_string_lossy().is_ascii() {
@@ -679,6 +808,32 @@ impl App {
             order_error: None,
         });
     }
+}
+
+fn outside_output_warning(selected: &Path, effective: &Path) -> std::io::Result<Option<String>> {
+    if selected == effective {
+        return Ok(None);
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(selected)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && is_audio_file(&entry.path()) {
+            names.push(entry.file_name());
+        }
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let preview = names
+        .iter()
+        .take(9)
+        .map(|name| name.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" → ");
+    Ok(Some(format!(
+        "선택한 위치 {}에 기존 음원 {}개가 있습니다.\n이번 결과는 {}에 저장하며, 이 폴더 밖의 기존 음원은 정리 대상에 포함되지 않습니다.\nDAP에서 WAV 폴더를 열어 결과를 확인하세요.\n\n기존 목록: {preview}",
+        selected.display(), names.len(), effective.display()
+    )))
 }
 
 /// 큰 폴더 박스를 그린다.
@@ -815,6 +970,95 @@ fn install_korean_font(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for_job(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        while app.job.is_some() {
+            app.pump_messages(ctx);
+            assert!(std::time::Instant::now() < deadline, "conversion timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn failed_conversion_is_not_presented_as_complete_success() {
+        let input = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        std::fs::write(input.path().join("01 broken.wav"), b"invalid WAV").unwrap();
+        let mut app = App {
+            input_dir: Some(input.path().to_owned()),
+            output_dir: Some(output.path().to_owned()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        app.start_job(&ctx);
+        wait_for_job(&mut app, &ctx);
+        assert!(app.summary.as_deref().unwrap().contains("일부 변환 실패"));
+        assert!(app.output_warning.is_some());
+        assert!(!app.log.iter().any(|line| line.starts_with("✓")));
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unreadable_input_is_reported_as_failure() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut app = App {
+            input_dir: Some(fixture.path().join("missing input")),
+            output_dir: Some(fixture.path().join("output")),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        app.start_job(&ctx);
+        wait_for_job(&mut app, &ctx);
+        assert!(app.summary.as_deref().unwrap().contains("실패 1개"));
+        assert!(app.output_warning.is_some());
+        assert!(app.log.iter().any(|line| line.contains("입력 탐색 실패")));
+        assert!(!fixture.path().join("output").exists());
+    }
+
+    #[test]
+    fn warning_distinguishes_existing_root_music_from_new_output() {
+        let selected = tempfile::tempdir().unwrap();
+        let effective = selected.path().join("WAV");
+        assert!(outside_output_warning(selected.path(), &effective)
+            .unwrap()
+            .is_none());
+        let existing = selected.path().join("07. Haruka.wav");
+        std::fs::write(&existing, b"existing song").unwrap();
+        let warning = outside_output_warning(selected.path(), &effective)
+            .unwrap()
+            .unwrap();
+        assert!(warning.contains("기존 음원 1개"));
+        assert!(warning.contains(&effective.display().to_string()));
+        assert!(warning.contains("07. Haruka.wav"));
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing song");
+    }
+
+    /// Uses the same worker as the Start button. Only run with explicit paths;
+    /// like a GUI conversion, results remain in the selected output folder.
+    #[test]
+    #[ignore = "requires WAV_REPRO_INPUT and WAV_REPRO_OUTPUT; writes converted results"]
+    fn reproduce_gui_conversion_from_environment() {
+        let input = PathBuf::from(std::env::var_os("WAV_REPRO_INPUT").expect("input folder"));
+        let selected = PathBuf::from(std::env::var_os("WAV_REPRO_OUTPUT").expect("output folder"));
+        let effective = effective_output_dir(&selected, true);
+        let mut app = App {
+            input_dir: Some(input),
+            output_dir: Some(selected),
+            format: Format(OutputFormat::Pcm16_44100),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        app.start_job(&ctx);
+        wait_for_job(&mut app, &ctx);
+        for line in &app.log {
+            println!("{line}");
+        }
+        println!("{}", app.summary.as_deref().unwrap_or_default());
+        assert!(app.summary.as_deref().unwrap().starts_with("✅"));
+        assert!(effective.is_dir());
+        assert!(app.log.iter().any(|line| line.starts_with("목록 ")));
+    }
 
     #[test]
     fn filename_warning_survives_completion_and_renders() {

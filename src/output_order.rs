@@ -3,6 +3,7 @@ use crate::naming::natural_cmp;
 use anyhow::{bail, Context, Result};
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
@@ -13,11 +14,17 @@ pub fn effective_output_dir(selected: &Path, arrange: bool) -> PathBuf {
         selected.to_path_buf()
     }
 }
+#[derive(Debug, Default)]
 pub struct OrderReport {
     pub physical_order_verified: bool,
+    /// Final enumeration after every child and parent directory has been rebuilt.
+    pub checked_directories: Vec<(PathBuf, Vec<OsString>)>,
 }
 
 pub fn arrange_output(root: &Path, outputs: &[PathBuf]) -> Result<OrderReport> {
+    if outputs.is_empty() {
+        return Ok(OrderReport::default());
+    }
     if root.parent().is_none() {
         bail!("카드 최상위는 교체할 수 없습니다. 원본 대체를 끄고 출력 폴더를 선택하면 WAV 폴더에 저장합니다.");
     }
@@ -26,11 +33,22 @@ pub fn arrange_output(root: &Path, outputs: &[PathBuf]) -> Result<OrderReport> {
         if !output.starts_with(root) {
             bail!("출력 경로가 선택한 폴더 밖에 있습니다");
         }
+        let metadata = std::fs::symlink_metadata(output)
+            .with_context(|| format!("출력 파일 확인 실패: {}", output.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "출력 경로가 일반 파일이 아닙니다 (폴더·링크는 정리 대상에서 제외): {}",
+                output.display()
+            );
+        }
         let mut parent = output.parent();
         while let Some(dir) = parent {
-            if dir.is_dir() {
-                directories.insert(dir.to_path_buf());
+            let metadata = std::fs::symlink_metadata(dir)
+                .with_context(|| format!("출력 폴더 확인 실패: {}", dir.display()))?;
+            if !metadata.file_type().is_dir() {
+                bail!("출력 폴더가 일반 폴더가 아닙니다: {}", dir.display());
             }
+            directories.insert(dir.to_path_buf());
             if dir == root {
                 break;
             }
@@ -44,12 +62,41 @@ pub fn arrange_output(root: &Path, outputs: &[PathBuf]) -> Result<OrderReport> {
     };
     let mut directories: Vec<_> = directories.into_iter().collect();
     directories.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for dir in &directories {
+        rebuild_directory(dir, physical)?;
+    }
+    let mut checked_directories = Vec::with_capacity(directories.len());
     for dir in directories {
-        rebuild_directory(&dir, physical)?;
+        let names = directory_names(&dir)
+            .with_context(|| format!("최종 출력 목록 확인 실패: {}", dir.display()))?;
+        if physical {
+            let mut sorted = names.clone();
+            sort_names(&mut sorted);
+            if names != sorted {
+                bail!(
+                    "전체 폴더 재구성 후 최종 번호순 검증에 실패했습니다: {}",
+                    dir.display()
+                );
+            }
+        }
+        checked_directories.push((dir, names));
     }
     Ok(OrderReport {
-        physical_order_verified: physical,
+        physical_order_verified: physical && !checked_directories.is_empty(),
+        checked_directories,
     })
+}
+
+fn directory_names(path: &Path) -> std::io::Result<Vec<OsString>> {
+    std::fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
+}
+
+fn sort_names(names: &mut [OsString]) {
+    names.sort_by(|a, b| {
+        natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
+    });
 }
 
 fn rebuild_directory(dir: &Path, verify: bool) -> Result<()> {
@@ -75,9 +122,7 @@ fn rebuild_directory(dir: &Path, verify: bool) -> Result<()> {
     if entries.len() < 2 {
         return Ok(());
     }
-    entries.sort_by(|a, b| {
-        natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()).then_with(|| a.cmp(b))
-    });
+    sort_names(&mut entries);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
@@ -87,17 +132,12 @@ fn rebuild_directory(dir: &Path, verify: bool) -> Result<()> {
     ));
     std::fs::create_dir(&stage)?;
     let old_empty = stage.with_extension("old");
-    let names = |path: &Path| -> std::io::Result<Vec<std::ffi::OsString>> {
-        std::fs::read_dir(path)?
-            .map(|e| e.map(|e| e.file_name()))
-            .collect()
-    };
     let result = (|| -> Result<()> {
         // Unlike reinsertion, this destination contains no deleted directory slots.
         for name in &entries {
             std::fs::rename(dir.join(name), stage.join(name))?;
         }
-        if verify && names(&stage)? != entries {
+        if verify && directory_names(&stage)? != entries {
             bail!("새 폴더의 번호순 기록 검증에 실패했습니다");
         }
         // Rename the empty original aside. On removable media a successful
@@ -132,7 +172,7 @@ fn rebuild_directory(dir: &Path, verify: bool) -> Result<()> {
         });
     }
     std::fs::remove_dir(&old_empty)?; // empty directory only
-    if verify && names(dir)? != entries {
+    if verify && directory_names(dir)? != entries {
         bail!(
             "폴더 교체 후 실제 순서 검증에 실패했습니다: {}",
             dir.display()

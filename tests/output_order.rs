@@ -2,6 +2,84 @@ use std::path::PathBuf;
 use wav_converter::output_order::arrange_output;
 
 #[test]
+fn empty_job_has_no_verified_directories_and_leaves_existing_files_alone() {
+    let fixture = tempfile::tempdir().unwrap();
+    let existing = fixture.path().join("07 existing.wav");
+    std::fs::write(&existing, b"existing song").unwrap();
+
+    let report = arrange_output(fixture.path(), &[]).unwrap();
+
+    assert!(!report.physical_order_verified);
+    assert!(report.checked_directories.is_empty());
+    assert_eq!(std::fs::read(existing).unwrap(), b"existing song");
+    assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    let missing_root = fixture.path().join("not created");
+    let report = arrange_output(&missing_root, &[]).unwrap();
+    assert!(!report.physical_order_verified);
+    assert!(report.checked_directories.is_empty());
+    assert!(!missing_root.exists());
+}
+
+#[test]
+fn missing_output_fails_before_rebuilding_existing_directories() {
+    let fixture = tempfile::tempdir().unwrap();
+    let album = fixture.path().join("album");
+    std::fs::create_dir(&album).unwrap();
+    let existing = album.join("07 existing.wav");
+    let missing = album.join("01 missing.wav");
+    std::fs::write(&existing, b"existing song").unwrap();
+
+    let error = arrange_output(&album, &[existing.clone(), missing.clone()]).unwrap_err();
+
+    assert!(format!("{error:#}").contains(&missing.display().to_string()));
+    assert_eq!(std::fs::read(&existing).unwrap(), b"existing song");
+    assert_eq!(std::fs::read_dir(&album).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn directory_cannot_stand_in_for_a_completed_output_file() {
+    let fixture = tempfile::tempdir().unwrap();
+    let directory = fixture.path().join("01 not a file.wav");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("keep.txt"), b"untouched").unwrap();
+
+    let error = arrange_output(fixture.path(), std::slice::from_ref(&directory)).unwrap_err();
+
+    assert!(format!("{error:#}").contains("일반 파일이 아닙니다"));
+    assert_eq!(
+        std::fs::read(directory.join("keep.txt")).unwrap(),
+        b"untouched"
+    );
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, ignore = "requires Windows symbolic-link privilege")]
+fn linked_output_is_rejected_without_moving_its_target() {
+    let fixture = tempfile::tempdir().unwrap();
+    let album = fixture.path().join("album");
+    std::fs::create_dir(&album).unwrap();
+    let target = fixture.path().join("original.wav");
+    let link = album.join("01 linked.wav");
+    std::fs::write(&target, b"original song").unwrap();
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_file(&target, &link);
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(&target, &link);
+    result.unwrap();
+
+    let error = arrange_output(&album, std::slice::from_ref(&link)).unwrap_err();
+
+    assert!(format!("{error:#}").contains("일반 파일이 아닙니다"));
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(target).unwrap(), b"original song");
+}
+
+#[test]
 fn drive_root_uses_dedicated_output_folder() {
     use wav_converter::output_order::effective_output_dir;
     #[cfg(windows)]
@@ -91,8 +169,26 @@ fn existing_disc_two_first_is_reinserted_without_changing_files() {
         }
     }
     std::fs::write(root.join("cover.jpg"), b"keep cover").unwrap();
+    let previous_song = root.join("Disc 2").join("04 previous.wav");
+    std::fs::write(&previous_song, b"keep previous song").unwrap();
     for _ in 0..2 {
-        arrange_output(&root, &outputs).unwrap();
+        let report = arrange_output(&root, &outputs).unwrap();
+        assert_eq!(report.checked_directories.len(), 3);
+        for (directory, names) in &report.checked_directories {
+            let actual: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(*names, actual);
+        }
+        assert!(report.checked_directories.iter().any(|(directory, names)| {
+            directory == &root.join("Disc 2")
+                && names.contains(&std::ffi::OsString::from("04 previous.wav"))
+        }));
+        assert_eq!(
+            std::fs::read(&previous_song).unwrap(),
+            b"keep previous song"
+        );
         for path in &outputs {
             let relative = path
                 .strip_prefix(&root)
