@@ -1,16 +1,60 @@
 // 릴리스 빌드에서는 콘솔 창이 같이 뜨지 않도록 함 (Windows).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
+use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread;
 
 use eframe::egui;
-use wav_converter::convert::{convert_file, convert_in_place, is_audio_file, OutputFormat};
 use walkdir::WalkDir;
+use wav_converter::convert::{convert_file, convert_in_place_to, is_audio_file, OutputFormat};
+use wav_converter::naming::{filename_warning, natural_cmp, wav_path};
+use wav_converter::output_order::arrange_output;
+
+const MAX_UI_LOGS: usize = 1000;
+
+fn diagnostic_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("wav-converter")
+        .join("diagnostics.log")
+}
+
+fn diagnostic(message: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let path = diagnostic_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{:?} {message}", std::time::SystemTime::now());
+    }
+}
 
 fn main() -> eframe::Result<()> {
+    let path = diagnostic_path();
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, path.with_extension("previous.log"));
+    }
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        diagnostic(&format!(
+            "PANIC: {info}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+        previous_hook(info);
+    }));
+    diagnostic("APP START");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 620.0])
@@ -18,14 +62,20 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
-        concat!("WAV 일괄 변환기  v", env!("CARGO_PKG_VERSION"), " (drag-hl)"),
+    let result = eframe::run_native(
+        concat!(
+            "WAV 일괄 변환기  v",
+            env!("CARGO_PKG_VERSION"),
+            " (drag-hl)"
+        ),
         native_options,
         Box::new(|cc| {
             install_korean_font(&cc.egui_ctx);
             Ok(Box::new(App::default()))
         }),
-    )
+    );
+    diagnostic(&format!("APP EXIT: {result:?}"));
+    result
 }
 
 /// 백그라운드 변환 스레드 → UI로 보내는 메시지.
@@ -34,6 +84,8 @@ enum Msg {
     Progress { done: usize, file: String },
     Log(String),
     Finished { ok: usize, failed: usize },
+    OrderError(String),
+    NameWarning(String),
 }
 
 /// 진행 중인 변환 작업 상태.
@@ -42,6 +94,7 @@ struct Job {
     total: usize,
     done: usize,
     current: String,
+    order_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -51,8 +104,11 @@ struct App {
     format: Format,
     /// 출력을 입력과 동일하게 (원본을 WAV로 대체).
     same_as_input: bool,
+    remove_artist: bool,
+    disable_ordering: bool,
+    filename_warning: Option<String>,
     job: Option<Job>,
-    log: Vec<String>,
+    log: VecDeque<String>,
     summary: Option<String>,
     // 끌어다 놓은 폴더가 들어갈 대상 (클릭으로 고정 / 위치 판정 실패 시 폴백).
     drop_target: Zone,
@@ -89,7 +145,6 @@ impl eframe::App for App {
         self.handle_dropped_files(ctx, drop_pos);
         self.pump_messages(ctx);
 
-        let running = self.job.is_some();
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
         // 파일을 드래그하는 동안: OS에서 커서 위치를 매 프레임 조회해 박스 강조.
@@ -99,11 +154,23 @@ impl eframe::App for App {
         } else {
             None
         };
-        let hot_input =
-            drag_cursor.is_some_and(|p| self.input_rect.is_some_and(|r| r.contains(p)));
+        let hot_input = drag_cursor.is_some_and(|p| self.input_rect.is_some_and(|r| r.contains(p)));
         let hot_output = !self.same_as_input
             && drag_cursor.is_some_and(|p| self.output_rect.is_some_and(|r| r.contains(p)));
 
+        self.draw_ui(ctx, hovering_files, hot_input, hot_output);
+    }
+}
+
+impl App {
+    fn draw_ui(
+        &mut self,
+        ctx: &egui::Context,
+        hovering_files: bool,
+        hot_input: bool,
+        hot_output: bool,
+    ) {
+        let running = self.job.is_some();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -202,6 +269,18 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // ===== 출력 규격 =====
+            ui.add_enabled_ui(!running, |ui| {
+                ui.checkbox(
+                    &mut self.remove_artist,
+                    "파일명에서 아티스트 제거 (번호 아티스트 - 곡제목 → 번호 곡제목)",
+                );
+            });
+            ui.add_enabled_ui(!running, |ui| {
+                let mut enabled = !self.disable_ordering;
+                ui.checkbox(&mut enabled, "DAP 재생 순서 맞추기 (변환 후 출력 폴더·곡을 번호순으로 정리)");
+                self.disable_ordering = !enabled;
+            });
+            ui.small("DAP용 순서는 출력 위치에 적용됩니다. 카드로 직접 출력하면 복사 순서의 영향을 피할 수 있습니다.");
             ui.horizontal(|ui| {
                 ui.label("출력 규격:");
                 ui.add_enabled_ui(!running, |ui| {
@@ -258,11 +337,7 @@ impl eframe::App for App {
                 } else {
                     job.done as f32 / job.total as f32
                 };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(format!("{} / {}", job.done, job.total))
-                        .desired_width(f32::INFINITY),
-                );
+                ui.add(egui::ProgressBar::new(frac).text(format!("{} / {}", job.done, job.total)));
                 ui.label(format!("변환 중: {}", job.current));
             } else if let Some(summary) = &self.summary {
                 ui.label(summary);
@@ -280,6 +355,26 @@ impl eframe::App for App {
                     }
                 });
         });
+        if let Some(message) = &self.filename_warning {
+            let mut close = false;
+            egui::Window::new("⚠ 비영문 파일명 경고")
+                .id(egui::Id::new("filename_warning"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .order(egui::Order::Foreground)
+                .collapsible(false)
+                .default_width(500.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            ui.label(message);
+                        });
+                    close = ui.button("확인").clicked();
+                });
+            if close {
+                self.filename_warning = None;
+            }
+        }
     }
 }
 
@@ -335,23 +430,44 @@ impl App {
                         job.done = done;
                         job.current = file;
                     }
-                    Ok(Msg::Log(line)) => self.log.push(line),
+                    Ok(Msg::Log(line)) => {
+                        self.log.push_back(line);
+                        while self.log.len() > MAX_UI_LOGS {
+                            self.log.pop_front();
+                        }
+                    }
                     Ok(Msg::Finished { ok, failed }) => {
-                        self.summary =
-                            Some(format!("✅ 완료 — 성공 {ok}개, 실패 {failed}개"));
+                        self.summary = Some(format!("✅ 완료 — 성공 {ok}개, 실패 {failed}개"));
+                        if let Some(error) = &job.order_error {
+                            self.summary = Some(format!(
+                                "변환 성공 {ok}개, 실패 {failed}개 · 순서 정리 실패: {error}"
+                            ));
+                        }
                         self.log
-                            .push(format!("── 작업 완료: 성공 {ok}, 실패 {failed} ──"));
+                            .push_back(format!("── 작업 완료: 성공 {ok}, 실패 {failed} ──"));
                         finished = true;
                         break;
                     }
+                    Ok(Msg::OrderError(error)) => {
+                        self.log.push_back(format!("⚠ 순서 정리 실패: {error}"));
+                        job.order_error = Some(error);
+                    }
+                    Ok(Msg::NameWarning(message)) => self.filename_warning = Some(message),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let message =
+                            "변환 작업이 예기치 않게 중단되었습니다. 오류 기록을 확인해주세요.";
+                        self.summary = Some(message.to_owned());
+                        diagnostic(message);
                         finished = true;
                         break;
                     }
                 }
             }
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        while self.log.len() > MAX_UI_LOGS {
+            self.log.pop_front();
         }
         if finished {
             self.job = None;
@@ -364,22 +480,37 @@ impl App {
         let output = self.output_dir.clone();
         let fmt = self.format.0;
         let in_place = self.same_as_input;
+        let remove_artist = self.remove_artist;
+        let arrange = !self.disable_ordering;
 
         self.log.clear();
         self.summary = None;
-        self.log.push(format!("입력: {}", input.display()));
+        self.filename_warning = None;
+        self.log.push_back(format!("입력: {}", input.display()));
         if in_place {
-            self.log.push("모드: 원본 대체 (in-place)".to_string());
+            self.log.push_back("모드: 원본 대체 (in-place)".to_string());
         } else if let Some(o) = &output {
-            self.log.push(format!("출력: {}", o.display()));
+            self.log.push_back(format!("출력: {}", o.display()));
         }
 
-        let (tx, rx) = channel::<Msg>();
+        diagnostic(&format!(
+            "JOB input={} output={output:?} format={fmt:?} in_place={in_place} remove_artist={remove_artist}",
+            input.display()
+        ));
+        self.log
+            .push_back(format!("오류 기록: {}", diagnostic_path().display()));
+        let (tx, rx) = sync_channel::<Msg>(256);
         let ctx2 = ctx.clone();
 
         thread::spawn(move || {
             // 대상 파일 목록을 미리 고정 (출력이 입력 하위에 있어도 무한 재귀 방지).
             let files: Vec<PathBuf> = WalkDir::new(&input)
+                .sort_by(|a, b| {
+                    natural_cmp(
+                        &a.file_name().to_string_lossy(),
+                        &b.file_name().to_string_lossy(),
+                    )
+                })
                 .into_iter()
                 .filter_map(Result::ok)
                 .filter(|e| e.file_type().is_file())
@@ -392,6 +523,7 @@ impl App {
 
             let mut ok = 0usize;
             let mut failed = 0usize;
+            let mut completed_paths = Vec::new();
 
             for (i, file) in files.iter().enumerate() {
                 let rel = file
@@ -407,29 +539,35 @@ impl App {
                 ctx2.request_repaint();
 
                 // 파일 하나가 패닉을 일으켜도 전체 작업이 죽지 않도록 격리.
+                diagnostic(&format!("FILE START: {}", file.display()));
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     if in_place {
-                        convert_in_place(file, fmt)
+                        convert_in_place_to(file, &wav_path(file, remove_artist), fmt)
                     } else {
                         let out_path = output
                             .as_ref()
                             .unwrap()
-                            .join(file.strip_prefix(&input).unwrap_or(Path::new("")))
-                            .with_extension("wav");
+                            .join(file.strip_prefix(&input).unwrap_or(Path::new("")));
+                        let out_path = wav_path(&out_path, remove_artist);
                         convert_file(file, &out_path, fmt)
                     }
                 }));
 
                 match result {
                     Ok(Ok(())) => {
+                        completed_paths
+                            .push(wav_path(file.strip_prefix(&input).unwrap(), remove_artist));
+                        diagnostic(&format!("FILE OK: {}", file.display()));
                         ok += 1;
                         let _ = tx.send(Msg::Log(format!("✓ {rel}")));
                     }
                     Ok(Err(e)) => {
+                        diagnostic(&format!("FILE ERROR: {} — {e:#}", file.display()));
                         failed += 1;
                         let _ = tx.send(Msg::Log(format!("⚠ 실패: {rel} — {e:#}")));
                     }
                     Err(_) => {
+                        diagnostic(&format!("FILE PANIC: {}", file.display()));
                         failed += 1;
                         let _ = tx.send(Msg::Log(format!("⚠ 내부 오류로 건너뜀: {rel}")));
                     }
@@ -437,6 +575,45 @@ impl App {
                 ctx2.request_repaint();
             }
 
+            if arrange && !files.is_empty() {
+                let root = if in_place {
+                    &input
+                } else {
+                    output.as_ref().unwrap()
+                };
+                let destinations: Vec<_> = files
+                    .iter()
+                    .map(|file| {
+                        let path = if in_place {
+                            file.clone()
+                        } else {
+                            root.join(file.strip_prefix(&input).unwrap())
+                        };
+                        wav_path(&path, remove_artist)
+                    })
+                    .collect();
+                let _ = tx.send(Msg::Log("DAP 재생 순서 정리 중…".to_owned()));
+                ctx2.request_repaint();
+                match arrange_output(root, &destinations) {
+                    Ok(()) => {
+                        let _ =
+                            tx.send(Msg::Log("✓ 출력 폴더·곡의 기록 순서 확인 완료".to_owned()));
+                    }
+                    Err(error) => {
+                        diagnostic(&format!("ORDER ERROR: {error:#}"));
+                        let _ = tx.send(Msg::OrderError(format!("{error:#}")));
+                    }
+                }
+            }
+            diagnostic(&format!("JOB FINISHED: ok={ok} failed={failed}"));
+            if let Some(warning) = filename_warning(&completed_paths) {
+                for path in &completed_paths {
+                    if !path.to_string_lossy().is_ascii() {
+                        let _ = tx.send(Msg::Log(format!("⚠ 비영문 이름: {}", path.display())));
+                    }
+                }
+                let _ = tx.send(Msg::NameWarning(warning));
+            }
             let _ = tx.send(Msg::Finished { ok, failed });
             ctx2.request_repaint();
         });
@@ -446,6 +623,7 @@ impl App {
             total: 0,
             done: 0,
             current: String::new(),
+            order_error: None,
         });
     }
 }
@@ -579,4 +757,128 @@ fn install_korean_font(ctx: &egui::Context) {
         .push("korean".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_warning_survives_completion_and_renders() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let (tx, rx) = sync_channel(2);
+        app.job = Some(Job {
+            rx,
+            total: 1,
+            done: 0,
+            current: String::new(),
+            order_error: None,
+        });
+        tx.send(Msg::NameWarning("01 日本語.wav".to_owned()))
+            .unwrap();
+        tx.send(Msg::Finished { ok: 1, failed: 0 }).unwrap();
+        app.pump_messages(&ctx);
+        assert!(app.job.is_none());
+        assert_eq!(app.filename_warning.as_deref(), Some("01 日本語.wav"));
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 620.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.draw_ui(ctx, false, false, false),
+            );
+        }
+        assert!(app.filename_warning.is_some());
+    }
+
+    #[test]
+    fn conversion_ui_stays_finite_while_pointer_moves() {
+        let ctx = egui::Context::default();
+        let (_tx, rx) = sync_channel(1);
+        let mut app = App::default();
+        app.job = Some(Job {
+            rx,
+            total: 28,
+            done: 6,
+            current: "07 Artist - Virtual Storm Hard Arrange.mp3".to_owned(),
+            order_error: None,
+        });
+        for i in 0..14 {
+            app.log.push_back(format!("Converted track {i}"));
+        }
+        for frame in 0..120 {
+            let width = if frame % 2 == 0 { 760.0 } else { 640.0 };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 620.0),
+                )),
+                events: vec![egui::Event::PointerMoved(egui::pos2(
+                    40.0 + (frame % 10) as f32 * 55.0,
+                    450.0 + (frame % 6) as f32 * 25.0,
+                ))],
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| app.draw_ui(ctx, false, false, false));
+            for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+                if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                    assert!(
+                        mesh.vertices
+                            .iter()
+                            .all(|v| v.pos.x.is_finite() && v.pos.y.is_finite()),
+                        "non-finite UI geometry"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn many_results_keep_ui_log_bounded() {
+        let mut app = App::default();
+        let ctx = egui::Context::default();
+        let (tx, rx) = sync_channel(256);
+        app.job = Some(Job {
+            rx,
+            total: 2000,
+            done: 0,
+            current: String::new(),
+            order_error: None,
+        });
+        for i in 0..2000 {
+            tx.send(Msg::Log(format!("file {i}"))).unwrap();
+            app.pump_messages(&ctx);
+        }
+        tx.send(Msg::Finished {
+            ok: 2000,
+            failed: 0,
+        })
+        .unwrap();
+        app.pump_messages(&ctx);
+        assert_eq!(app.log.len(), MAX_UI_LOGS);
+        assert!(app.job.is_none());
+        assert!(app.summary.unwrap().contains("2000"));
+    }
+
+    #[test]
+    fn disconnected_worker_reports_interruption() {
+        let mut app = App::default();
+        let (tx, rx) = sync_channel(1);
+        app.job = Some(Job {
+            rx,
+            total: 1,
+            done: 0,
+            current: String::new(),
+            order_error: None,
+        });
+        drop(tx);
+        app.pump_messages(&egui::Context::default());
+        assert!(app.job.is_none());
+        assert!(app.summary.unwrap().contains("중단"));
+    }
 }

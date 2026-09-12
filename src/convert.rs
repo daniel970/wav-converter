@@ -83,8 +83,23 @@ struct DecCtx {
 
 /// 파일 하나를 디코딩 → 변환 → WAV로 저장 (스트리밍).
 pub fn convert_file(input: &Path, output: &Path, fmt: OutputFormat) -> Result<()> {
-    let mut ctx = open_decoder(input)
-        .with_context(|| format!("디코딩 준비 실패: {}", input.display()))?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temporary = tempfile::NamedTempFile::new_in(parent).context("임시 출력 파일 생성 실패")?;
+    convert_file_staged(input, temporary.path(), fmt)?;
+    temporary
+        .persist(output)
+        .map_err(|e| e.error)
+        .with_context(|| format!("출력 파일 교체 실패: {}", output.display()))?;
+    Ok(())
+}
+
+fn convert_file_staged(input: &Path, output: &Path, fmt: OutputFormat) -> Result<()> {
+    let mut ctx =
+        open_decoder(input).with_context(|| format!("디코딩 준비 실패: {}", input.display()))?;
 
     let target_rate = fmt.target_rate().unwrap_or(ctx.sample_rate);
     let target_bits = fmt.target_bits().unwrap_or_else(|| match ctx.src_bits {
@@ -124,17 +139,19 @@ pub fn convert_file(input: &Path, output: &Path, fmt: OutputFormat) -> Result<()
 /// (mp3 등은 원본 삭제 후 .wav 생성, 이미 .wav면 제자리 덮어쓰기)
 pub fn convert_in_place(file: &Path, fmt: OutputFormat) -> Result<()> {
     let final_path = file.with_extension("wav");
-    let tmp = file.with_extension("wavtmp");
+    convert_in_place_to(file, &final_path, fmt)
+}
 
-    convert_file(file, &tmp, fmt)?;
-
-    // 원본 확장자가 wav가 아니면(=원본과 최종 경로가 다르면) 원본 삭제.
-    if file != final_path {
+pub fn convert_in_place_to(file: &Path, final_path: &Path, fmt: OutputFormat) -> Result<()> {
+    let same_file = file == final_path
+        || (final_path.exists()
+            && std::fs::canonicalize(file)? == std::fs::canonicalize(final_path)?);
+    convert_file(file, final_path, fmt)?;
+    // 최종 WAV가 저장된 뒤에만 원본을 삭제한다.
+    if !same_file {
         std::fs::remove_file(file)
             .with_context(|| format!("원본 삭제 실패: {}", file.display()))?;
     }
-    std::fs::rename(&tmp, &final_path)
-        .with_context(|| format!("임시 파일 이동 실패: {}", final_path.display()))?;
     Ok(())
 }
 
@@ -178,6 +195,9 @@ fn open_decoder(path: &Path) -> Result<DecCtx> {
     let sample_rate = codec_params
         .sample_rate
         .ok_or_else(|| anyhow!("샘플레이트 정보 없음"))?;
+    if channels == 0 || sample_rate == 0 {
+        return Err(anyhow!("유효하지 않은 채널 수 또는 샘플레이트"));
+    }
     let src_bits = codec_params.bits_per_sample;
 
     Ok(DecCtx {
@@ -213,6 +233,13 @@ fn decode_loop(ctx: &mut DecCtx, mut on_samples: impl FnMut(&[f32]) -> Result<()
 
         match ctx.decoder.decode(&packet) {
             Ok(audio) => {
+                if audio.spec().channels.count() != ctx.channels
+                    || audio.spec().rate != ctx.sample_rate
+                {
+                    return Err(anyhow!(
+                        "오디오 도중 채널 수 또는 샘플레이트가 변경되어 변환을 중단함"
+                    ));
+                }
                 let need = audio.capacity() as u64;
                 if sample_buf.is_none() || need > cap {
                     let spec = *audio.spec();
@@ -242,7 +269,9 @@ fn stream_direct<W: Write + Seek>(
     writer: &mut hound::WavWriter<W>,
     bits: u16,
 ) -> Result<()> {
-    decode_loop(ctx, |interleaved| write_interleaved(writer, interleaved, bits))
+    decode_loop(ctx, |interleaved| {
+        write_interleaved(writer, interleaved, bits)
+    })
 }
 
 /// 리샘플링하며 스트리밍 기록.
@@ -253,8 +282,7 @@ fn stream_resampled<W: Write + Seek>(
     bits: u16,
 ) -> Result<()> {
     use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
-        WindowFunction,
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
     };
 
     let channels = ctx.channels;
@@ -349,7 +377,8 @@ fn write_planar<W: Write + Seek>(
         16 => {
             for f in 0..frames {
                 for ch in planar.iter().take(channels) {
-                    writer.write_sample((ch[f].clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)?;
+                    writer
+                        .write_sample((ch[f].clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)?;
                 }
             }
         }

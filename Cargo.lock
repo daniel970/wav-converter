@@ -3704,6 +3704,7 @@ dependencies = [
  "rfd",
  "rubato",
  "symphonia",
+ "tempfile",
  "walkdir",
  "windows-sys 0.59.0",
 ]

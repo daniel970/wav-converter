@@ -2,3 +2,5 @@
 //! GUI(main.rs)와 통합 테스트(tests/)가 함께 사용한다.
 
 pub mod convert;
+pub mod naming;
+pub mod output_order;
