@@ -14,7 +14,7 @@ use wav_converter::convert::{convert_file, convert_in_place_to, is_audio_file, O
 use wav_converter::naming::{
     filename_warning, has_track_prefix, natural_cmp, numbered_wav_path, read_track_number,
 };
-use wav_converter::output_order::arrange_output;
+use wav_converter::output_order::{arrange_output, effective_output_dir};
 
 const MAX_UI_LOGS: usize = 1000;
 
@@ -289,6 +289,11 @@ impl App {
                 self.disable_track_prefix = !enabled;
             });
             ui.small("DAP용 순서는 출력 위치에 적용됩니다. 카드로 직접 출력하면 복사 순서의 영향을 피할 수 있습니다.");
+            if !self.same_as_input {
+                if let Some(selected) = &self.output_dir {
+                    ui.small(format!("실제 저장 위치: {}", effective_output_dir(selected, !self.disable_ordering).display()));
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label("출력 규격:");
                 ui.add_enabled_ui(!running, |ui| {
@@ -500,7 +505,10 @@ impl App {
     /// 변환 작업 시작 (파일 목록을 먼저 수집 후 스레드 실행).
     fn start_job(&mut self, ctx: &egui::Context) {
         let input = self.input_dir.clone().unwrap();
-        let output = self.output_dir.clone();
+        let output = self
+            .output_dir
+            .as_ref()
+            .map(|p| effective_output_dir(p, !self.disable_ordering));
         let fmt = self.format.0;
         let in_place = self.same_as_input;
         let remove_artist = self.remove_artist;
@@ -518,7 +526,7 @@ impl App {
         }
 
         diagnostic(&format!(
-            "JOB input={} output={output:?} format={fmt:?} in_place={in_place} remove_artist={remove_artist}",
+            "JOB input={} output={output:?} format={fmt:?} in_place={in_place} remove_artist={remove_artist} arrange={arrange}",
             input.display()
         ));
         self.log
@@ -635,9 +643,14 @@ impl App {
                 let _ = tx.send(Msg::Log("DAP 재생 순서 정리 중…".to_owned()));
                 ctx2.request_repaint();
                 match arrange_output(root, &destinations) {
-                    Ok(()) => {
-                        let _ =
-                            tx.send(Msg::Log("✓ 출력 폴더·곡의 기록 순서 확인 완료".to_owned()));
+                    Ok(report) => {
+                        let message = if report.physical_order_verified {
+                            "✓ 카드의 실제 폴더·곡 순서 검증 완료"
+                        } else {
+                            "✓ 출력 폴더 재구성 완료 (카드로 복사하는 순서는 별도 적용)"
+                        };
+                        diagnostic(message);
+                        let _ = tx.send(Msg::Log(message.to_owned()));
                     }
                     Err(error) => {
                         diagnostic(&format!("ORDER ERROR: {error:#}"));

@@ -1,6 +1,72 @@
 use std::path::PathBuf;
 use wav_converter::output_order::arrange_output;
 
+#[test]
+fn drive_root_uses_dedicated_output_folder() {
+    use wav_converter::output_order::effective_output_dir;
+    #[cfg(windows)]
+    let root = std::path::Path::new("E:\\");
+    #[cfg(not(windows))]
+    let root = std::path::Path::new("/");
+    assert_eq!(effective_output_dir(root, true), root.join("WAV"));
+    assert_eq!(effective_output_dir(root, false), root);
+    let album = root.join("Album");
+    assert_eq!(effective_output_dir(&album, true), album);
+}
+
+#[test]
+#[ignore = "requires WAV_ORDER_TEST_ROOT pointing to an attached FAT card"]
+fn fat_card_repeated_rebuild_with_holes_and_unpadded_numbers() {
+    let root = std::env::var_os("WAV_ORDER_TEST_ROOT").expect("card root");
+    let fixture = tempfile::tempdir_in(root).unwrap();
+    let album = fixture.path().join("album");
+    std::fs::create_dir(&album).unwrap();
+    let mut paths = Vec::new();
+    for number in (14..=28).chain(1..=13) {
+        let file = album.join(format!(
+            "{number}. {}.wav",
+            "long name ".repeat(number % 4 + 1)
+        ));
+        std::fs::write(&file, number.to_string()).unwrap();
+        paths.push(file);
+    }
+    for _ in 0..3 {
+        let hole = album.join("temporary long filename creating deleted slots.tmp");
+        std::fs::write(&hole, b"temporary").unwrap();
+        std::fs::remove_file(hole).unwrap();
+        assert!(
+            arrange_output(&album, &paths)
+                .unwrap()
+                .physical_order_verified
+        );
+        let actual: Vec<usize> = std::fs::read_dir(&album)
+            .unwrap()
+            .map(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .split('.')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(actual, (1..=28).collect::<Vec<_>>());
+        for path in &paths {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .split('.')
+                    .next()
+                    .unwrap()
+            );
+        }
+    }
+}
+
 fn fixture(label: &str) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
