@@ -1,6 +1,72 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
+pub fn has_track_prefix(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let digits = stem.bytes().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && stem[digits..].starts_with(|c: char| c == '.' || c.is_whitespace())
+}
+
+pub fn numbered_wav_path(path: &Path, remove_artist: bool, track: Option<u32>) -> PathBuf {
+    if !has_track_prefix(path) {
+        if let Some(number) = track.filter(|n| *n > 0) {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let numbered = path.with_file_name(format!("{number} {stem}.wav"));
+            let cleaned = wav_path(&numbered, remove_artist);
+            let stem = cleaned.file_stem().unwrap().to_string_lossy();
+            let (_, title) = stem.split_once(' ').unwrap();
+            return cleaned.with_file_name(format!("{number}. {title}.wav"));
+        }
+    }
+    wav_path(path, remove_artist)
+}
+
+fn parse_track(value: &str) -> Option<u32> {
+    value
+        .split('/')
+        .next()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+}
+
+/// Read track metadata (# in Explorer), without decoding the audio.
+pub fn read_track_number(path: &Path) -> anyhow::Result<Option<u32>> {
+    use symphonia::core::{
+        io::MediaSourceStream,
+        meta::{MetadataRevision, StandardTagKey},
+        probe::Hint,
+    };
+    fn from_revision(revision: &MetadataRevision) -> Option<u32> {
+        revision
+            .tags()
+            .iter()
+            .filter(|t| t.std_key == Some(StandardTagKey::TrackNumber))
+            .find_map(|t| parse_track(&t.value.to_string()))
+    }
+    let file = std::fs::File::open(path)?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut probed = symphonia::default::get_probe().format(
+        &hint,
+        stream,
+        &Default::default(),
+        &Default::default(),
+    )?;
+    if let Some(metadata) = probed.metadata.get() {
+        if let Some(number) = metadata.current().and_then(from_revision) {
+            return Ok(Some(number));
+        }
+    }
+    Ok(probed.format.metadata().current().and_then(from_revision))
+}
+
 pub fn filename_warning(paths: &[PathBuf]) -> Option<String> {
     let names: std::collections::BTreeSet<_> = paths
         .iter()
@@ -78,6 +144,37 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn track_numbers_support_totals_and_reject_invalid_values() {
+        assert_eq!(parse_track("03/28"), Some(3));
+        assert_eq!(parse_track(" 12 "), Some(12));
+        for value in ["0", "-1", "track 3", "", "99999999999999"] {
+            assert_eq!(parse_track(value), None);
+        }
+    }
+    #[test]
+    fn prefixes_only_unnumbered_names_and_combines_artist_removal() {
+        assert_eq!(
+            numbered_wav_path(Path::new("Disc 1/Usagi Flap.mp3"), false, Some(1)),
+            Path::new("Disc 1/1. Usagi Flap.wav")
+        );
+        assert_eq!(
+            numbered_wav_path(Path::new("F1ghtback.mp3"), false, Some(23)),
+            Path::new("23. F1ghtback.wav")
+        );
+        assert_eq!(
+            numbered_wav_path(Path::new("Artist - Title.mp3"), true, Some(2)),
+            Path::new("2. Title.wav")
+        );
+        assert_eq!(
+            numbered_wav_path(Path::new("01. Title.mp3"), false, Some(9)),
+            Path::new("01. Title.wav")
+        );
+        assert_eq!(
+            numbered_wav_path(Path::new("Title.mp3"), false, None),
+            Path::new("Title.wav")
+        );
+    }
     #[test]
     fn removes_artist_and_preserves_title_hyphens() {
         assert_eq!(

@@ -11,7 +11,9 @@ use std::thread;
 use eframe::egui;
 use walkdir::WalkDir;
 use wav_converter::convert::{convert_file, convert_in_place_to, is_audio_file, OutputFormat};
-use wav_converter::naming::{filename_warning, natural_cmp, wav_path};
+use wav_converter::naming::{
+    filename_warning, has_track_prefix, natural_cmp, numbered_wav_path, read_track_number,
+};
 use wav_converter::output_order::arrange_output;
 
 const MAX_UI_LOGS: usize = 1000;
@@ -105,6 +107,7 @@ struct App {
     /// 출력을 입력과 동일하게 (원본을 WAV로 대체).
     same_as_input: bool,
     remove_artist: bool,
+    disable_track_prefix: bool,
     disable_ordering: bool,
     filename_warning: Option<String>,
     job: Option<Job>,
@@ -279,6 +282,11 @@ impl App {
                 let mut enabled = !self.disable_ordering;
                 ui.checkbox(&mut enabled, "DAP 재생 순서 맞추기 (변환 후 출력 폴더·곡을 번호순으로 정리)");
                 self.disable_ordering = !enabled;
+            });
+            ui.add_enabled_ui(!running, |ui| {
+                let mut enabled = !self.disable_track_prefix;
+                ui.checkbox(&mut enabled, "번호 없는 파일명 앞에 트랙 번호(#) 붙이기 (1. 곡제목)");
+                self.disable_track_prefix = !enabled;
             });
             ui.small("DAP용 순서는 출력 위치에 적용됩니다. 카드로 직접 출력하면 복사 순서의 영향을 피할 수 있습니다.");
             ui.horizontal(|ui| {
@@ -496,6 +504,7 @@ impl App {
         let fmt = self.format.0;
         let in_place = self.same_as_input;
         let remove_artist = self.remove_artist;
+        let use_track_number = !self.disable_track_prefix;
         let arrange = !self.disable_ordering;
 
         self.log.clear();
@@ -536,11 +545,39 @@ impl App {
             let _ = tx.send(Msg::Total(files.len()));
             ctx2.request_repaint();
 
+            let mut plans = Vec::new();
+            for file in &files {
+                let track = if use_track_number && !has_track_prefix(file) {
+                    match std::panic::catch_unwind(AssertUnwindSafe(|| read_track_number(file))) {
+                        Ok(Ok(Some(number))) => Some(number),
+                        other => {
+                            let reason = match other {
+                                Ok(Err(e)) => e.to_string(),
+                                Err(_) => "메타데이터 내부 오류".to_owned(),
+                                _ => "트랙 번호 태그 없음".to_owned(),
+                            };
+                            let _ = tx.send(Msg::Log(format!(
+                                "⚠ 번호를 붙이지 않음: {} — {reason}",
+                                file.display()
+                            )));
+                            ctx2.request_repaint();
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let relative =
+                    numbered_wav_path(file.strip_prefix(&input).unwrap(), remove_artist, track);
+                plans.push((file.clone(), relative));
+            }
+            plans.sort_by(|a, b| natural_cmp(&a.1.to_string_lossy(), &b.1.to_string_lossy()));
+
             let mut ok = 0usize;
             let mut failed = 0usize;
             let mut completed_paths = Vec::new();
 
-            for (i, file) in files.iter().enumerate() {
+            for (i, (file, relative)) in plans.iter().enumerate() {
                 let rel = file
                     .strip_prefix(&input)
                     .unwrap_or(Path::new(""))
@@ -557,24 +594,19 @@ impl App {
                 diagnostic(&format!("FILE START: {}", file.display()));
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     if in_place {
-                        convert_in_place_to(file, &wav_path(file, remove_artist), fmt)
+                        convert_in_place_to(file, &input.join(relative), fmt)
                     } else {
-                        let out_path = output
-                            .as_ref()
-                            .unwrap()
-                            .join(file.strip_prefix(&input).unwrap_or(Path::new("")));
-                        let out_path = wav_path(&out_path, remove_artist);
+                        let out_path = output.as_ref().unwrap().join(relative);
                         convert_file(file, &out_path, fmt)
                     }
                 }));
 
                 match result {
                     Ok(Ok(())) => {
-                        completed_paths
-                            .push(wav_path(file.strip_prefix(&input).unwrap(), remove_artist));
+                        completed_paths.push(relative.clone());
                         diagnostic(&format!("FILE OK: {}", file.display()));
                         ok += 1;
-                        let _ = tx.send(Msg::Log(format!("✓ {rel}")));
+                        let _ = tx.send(Msg::Log(format!("✓ {rel} → {}", relative.display())));
                     }
                     Ok(Err(e)) => {
                         diagnostic(&format!("FILE ERROR: {} — {e:#}", file.display()));
@@ -596,16 +628,9 @@ impl App {
                 } else {
                     output.as_ref().unwrap()
                 };
-                let destinations: Vec<_> = files
+                let destinations: Vec<_> = plans
                     .iter()
-                    .map(|file| {
-                        let path = if in_place {
-                            file.clone()
-                        } else {
-                            root.join(file.strip_prefix(&input).unwrap())
-                        };
-                        wav_path(&path, remove_artist)
-                    })
+                    .map(|(_, relative)| root.join(relative))
                     .collect();
                 let _ = tx.send(Msg::Log("DAP 재생 순서 정리 중…".to_owned()));
                 ctx2.request_repaint();
