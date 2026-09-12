@@ -443,6 +443,21 @@ impl App {
                                 "변환 성공 {ok}개, 실패 {failed}개 · 순서 정리 실패: {error}"
                             ));
                         }
+                        if !cfg!(test) {
+                            let message = wav_converter::notification::completion_message(
+                                ok,
+                                failed,
+                                job.order_error.is_some(),
+                                self.filename_warning.is_some(),
+                            );
+                            thread::spawn(move || {
+                                if let Err(error) =
+                                    wav_converter::notification::show_completion(&message)
+                                {
+                                    diagnostic(&format!("NOTIFICATION ERROR: {error:#}"));
+                                }
+                            });
+                        }
                         self.log
                             .push_back(format!("── 작업 완료: 성공 {ok}, 실패 {failed} ──"));
                         finished = true;

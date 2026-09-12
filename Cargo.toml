@@ -28,6 +28,8 @@ tempfile = "3"
 
 # Windows 전용: 드래그&드롭 시 OS에서 마우스 좌표 직접 조회.
 [target.'cfg(windows)'.dependencies]
+winrt-notification = "0.5.1"
+winreg = "0.55"
 raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
