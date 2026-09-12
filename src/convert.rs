@@ -10,6 +10,7 @@
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use symphonia::core::audio::SampleBuffer;
@@ -81,15 +82,51 @@ struct DecCtx {
     src_bits: Option<u32>,
 }
 
+/// 변환 실패와 구분할 수 있는 사용자 취소 결과.
+#[derive(Debug)]
+pub struct ConversionCancelled;
+
+impl std::fmt::Display for ConversionCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("사용자가 변환을 취소했습니다")
+    }
+}
+
+impl std::error::Error for ConversionCancelled {}
+
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.is::<ConversionCancelled>()
+}
+
+fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(ConversionCancelled.into());
+    }
+    Ok(())
+}
+
 /// 파일 하나를 디코딩 → 변환 → WAV로 저장 (스트리밍).
 pub fn convert_file(input: &Path, output: &Path, fmt: OutputFormat) -> Result<()> {
+    convert_file_cancellable(input, output, fmt, &AtomicBool::new(false))
+}
+
+/// 패킷 처리와 샘플 기록 사이에 취소를 확인한다. 완성 전 취소되면 임시 파일만
+/// 제거하고 기존 출력은 유지한다. 완성된 파일 교체 이후의 작업 취소/복원은 호출자가 맡는다.
+pub fn convert_file_cancellable(
+    input: &Path,
+    output: &Path,
+    fmt: OutputFormat,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    check_cancelled(cancel)?;
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let temporary = tempfile::NamedTempFile::new_in(parent).context("임시 출력 파일 생성 실패")?;
-    convert_file_staged(input, temporary.path(), fmt)?;
+    convert_file_staged(input, temporary.path(), fmt, cancel)?;
+    check_cancelled(cancel)?;
     temporary
         .persist(output)
         .map_err(|e| e.error)
@@ -97,7 +134,13 @@ pub fn convert_file(input: &Path, output: &Path, fmt: OutputFormat) -> Result<()
     Ok(())
 }
 
-fn convert_file_staged(input: &Path, output: &Path, fmt: OutputFormat) -> Result<()> {
+fn convert_file_staged(
+    input: &Path,
+    output: &Path,
+    fmt: OutputFormat,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    check_cancelled(cancel)?;
     let mut ctx =
         open_decoder(input).with_context(|| format!("디코딩 준비 실패: {}", input.display()))?;
 
@@ -122,13 +165,14 @@ fn convert_file_staged(input: &Path, output: &Path, fmt: OutputFormat) -> Result
         .with_context(|| format!("WAV 파일 생성 실패: {}", output.display()))?;
 
     if target_rate == ctx.sample_rate {
-        stream_direct(&mut ctx, &mut writer, target_bits)
+        stream_direct(&mut ctx, &mut writer, target_bits, cancel)
             .with_context(|| format!("변환 실패: {}", input.display()))?;
     } else {
-        stream_resampled(&mut ctx, &mut writer, target_rate, target_bits)
+        stream_resampled(&mut ctx, &mut writer, target_rate, target_bits, cancel)
             .with_context(|| format!("리샘플 변환 실패: {}", input.display()))?;
     }
 
+    check_cancelled(cancel)?;
     writer
         .finalize()
         .with_context(|| format!("WAV 마무리 실패: {}", output.display()))?;
@@ -212,12 +256,17 @@ fn open_decoder(path: &Path) -> Result<DecCtx> {
 
 /// 패킷을 하나씩 디코딩하며 인터리브 f32 슬라이스를 콜백에 넘긴다.
 /// (메모리 사용을 일정하게 유지)
-fn decode_loop(ctx: &mut DecCtx, mut on_samples: impl FnMut(&[f32]) -> Result<()>) -> Result<()> {
+fn decode_loop(
+    ctx: &mut DecCtx,
+    cancel: &AtomicBool,
+    mut on_samples: impl FnMut(&[f32]) -> Result<()>,
+) -> Result<()> {
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
     let mut cap: u64 = 0;
     let mut got_any = false;
 
     loop {
+        check_cancelled(cancel)?;
         let packet = match ctx.format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -233,6 +282,7 @@ fn decode_loop(ctx: &mut DecCtx, mut on_samples: impl FnMut(&[f32]) -> Result<()
 
         match ctx.decoder.decode(&packet) {
             Ok(audio) => {
+                check_cancelled(cancel)?;
                 if audio.spec().channels.count() != ctx.channels
                     || audio.spec().rate != ctx.sample_rate
                 {
@@ -268,9 +318,14 @@ fn stream_direct<W: Write + Seek>(
     ctx: &mut DecCtx,
     writer: &mut hound::WavWriter<W>,
     bits: u16,
+    cancel: &AtomicBool,
 ) -> Result<()> {
-    decode_loop(ctx, |interleaved| {
-        write_interleaved(writer, interleaved, bits)
+    decode_loop(ctx, cancel, |interleaved| {
+        for chunk in interleaved.chunks(4096) {
+            check_cancelled(cancel)?;
+            write_interleaved(writer, chunk, bits)?;
+        }
+        Ok(())
     })
 }
 
@@ -280,6 +335,7 @@ fn stream_resampled<W: Write + Seek>(
     writer: &mut hound::WavWriter<W>,
     target_rate: u32,
     bits: u16,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     use rubato::{
         Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -309,31 +365,36 @@ fn stream_resampled<W: Write + Seek>(
     // 채널별 대기 버퍼 (chunk 만큼 모이면 처리).
     let mut pending: Vec<Vec<f32>> = vec![Vec::with_capacity(chunk * 2); channels];
 
-    decode_loop(ctx, |interleaved| {
-        for frame in interleaved.chunks_exact(channels) {
-            for (c, &s) in frame.iter().enumerate() {
-                pending[c].push(s);
+    decode_loop(ctx, cancel, |interleaved| {
+        for input_chunk in interleaved.chunks(channels * chunk) {
+            check_cancelled(cancel)?;
+            for frame in input_chunk.chunks_exact(channels) {
+                for (c, &s) in frame.iter().enumerate() {
+                    pending[c].push(s);
+                }
             }
         }
         while pending[0].len() >= chunk {
+            check_cancelled(cancel)?;
             let block: Vec<Vec<f32>> = pending.iter().map(|c| c[..chunk].to_vec()).collect();
             for c in pending.iter_mut() {
                 c.drain(..chunk);
             }
             let refs: Vec<&[f32]> = block.iter().map(|v| v.as_slice()).collect();
             let out = resampler.process(&refs, None).context("리샘플 처리 실패")?;
-            write_planar(writer, &out, bits)?;
+            write_planar(writer, &out, bits, cancel)?;
         }
         Ok(())
     })?;
 
     // 남은 부분 flush.
     if !pending[0].is_empty() {
+        check_cancelled(cancel)?;
         let refs: Vec<&[f32]> = pending.iter().map(|v| v.as_slice()).collect();
         let out = resampler
             .process_partial(Some(refs.as_slice()), None)
             .context("리샘플 마무리 실패")?;
-        write_planar(writer, &out, bits)?;
+        write_planar(writer, &out, bits, cancel)?;
     }
 
     Ok(())
@@ -367,6 +428,7 @@ fn write_planar<W: Write + Seek>(
     writer: &mut hound::WavWriter<W>,
     planar: &[Vec<f32>],
     bits: u16,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     if planar.is_empty() {
         return Ok(());
@@ -376,6 +438,9 @@ fn write_planar<W: Write + Seek>(
     match bits {
         16 => {
             for f in 0..frames {
+                if f % 1024 == 0 {
+                    check_cancelled(cancel)?;
+                }
                 for ch in planar.iter().take(channels) {
                     writer
                         .write_sample((ch[f].clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)?;
@@ -385,6 +450,9 @@ fn write_planar<W: Write + Seek>(
         24 => {
             const MAX_24: f32 = 8_388_607.0;
             for f in 0..frames {
+                if f % 1024 == 0 {
+                    check_cancelled(cancel)?;
+                }
                 for ch in planar.iter().take(channels) {
                     writer.write_sample((ch[f].clamp(-1.0, 1.0) * MAX_24).round() as i32)?;
                 }
